@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\District;
 use App\Models\DistrictRiskAssessment;
 use App\Models\ClimateObservation;
+use App\Models\ConflictEvent;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -142,7 +143,7 @@ class RiskScoringService
     protected function calculateClimateScore(District $district, Carbon $date, int $days): array
     {
         $startDate = $date->copy()->subDays($days);
-        
+
         // Get rainfall observations for the analysis period
         $observations = ClimateObservation::where('district_id', $district->id)
             ->whereBetween('observation_date', [$startDate, $date])
@@ -164,13 +165,13 @@ class RiskScoringService
         // Calculate total rainfall for period
         $totalRainfall = $observations->sum('rainfall_mm');
         $avgDailyRainfall = $totalRainfall / $observations->count();
-        
+
         // Get district climate zone for baseline comparison
         $climaticBaseline = $this->getClimaticBaseline($district, $date);
-        
+
         // Calculate anomaly percentage
         $expectedRainfall = $climaticBaseline['expected_mm_per_day'] * $days;
-        $anomalyPct = $expectedRainfall > 0 
+        $anomalyPct = $expectedRainfall > 0
             ? (($totalRainfall - $expectedRainfall) / $expectedRainfall) * 100
             : 0;
 
@@ -182,9 +183,9 @@ class RiskScoringService
         // Above normal (+15% to +30%): 2-4 points
         // Heavy rainfall (+30% to +50%): 4-6 points
         // Extreme rainfall (> +50%): 6-8 points
-        
+
         $score = 0;
-        
+
         if ($anomalyPct < -50) {
             $score = 9 + min(abs($anomalyPct - 50) / 20, 1); // 9-10
         } elseif ($anomalyPct < -30) {
@@ -200,12 +201,12 @@ class RiskScoringService
         } else {
             $score = 6 + min(($anomalyPct - 50) / 30, 2); // 6-8
         }
-        
+
         // Cap at 10
         $score = min($score, 10.0);
 
         // Identify heavy rainfall events (potential flooding)
-        $heavyRainfallDays = $observations->filter(function($obs) {
+        $heavyRainfallDays = $observations->filter(function ($obs) {
             return $obs->rainfall_mm > 20; // >20mm in a day
         })->count();
 
@@ -236,10 +237,10 @@ class RiskScoringService
     protected function getClimaticBaseline(District $district, Carbon $date): array
     {
         $month = $date->month;
-        
+
         // Far North (Sahel)
         $sahelDistricts = ['Mora', 'Makary', 'Kousseri', 'Maroua', 'Kolofata', 'Logone-Birni', 'Yagoua'];
-        
+
         if (in_array($district->name, $sahelDistricts)) {
             // Sahel: Rainy season July-September, dry season November-March
             if ($month >= 7 && $month <= 9) {
@@ -250,7 +251,7 @@ class RiskScoringService
                 return ['zone' => 'Sahel', 'expected_mm_per_day' => 2.0]; // ~60mm/month
             }
         }
-        
+
         // East Region (Rainforest)
         if ($month >= 9 && $month <= 11) {
             return ['zone' => 'Rainforest', 'expected_mm_per_day' => 6.0]; // ~180mm/month
@@ -268,7 +269,7 @@ class RiskScoringService
     {
         $maxDry = 0;
         $currentDry = 0;
-        
+
         foreach ($observations as $obs) {
             if ($obs->rainfall_mm < 1.0) {
                 $currentDry++;
@@ -277,7 +278,7 @@ class RiskScoringService
                 $currentDry = 0;
             }
         }
-        
+
         return $maxDry;
     }
 
@@ -296,44 +297,90 @@ class RiskScoringService
     }
 
     /**
-     * Calculate conflict risk score
+     * Calculate conflict score for a district
+     * Uses real conflict event data with signal-type weighting
      */
     protected function calculateConflictScore(District $district, Carbon $date, int $days): array
     {
         $startDate = $date->copy()->subDays($days);
 
-        $events = DB::table('conflict_events')
-            ->where('district_id', $district->id)
-            ->where('event_date', '>=', $startDate)
-            ->where('event_date', '<=', $date)
+        // Get recent conflict events
+        $recentEvents = ConflictEvent::where('district_id', $district->id)
+            ->whereBetween('event_date', [$startDate, $date])
             ->where('status', 'active')
             ->get();
 
-        if ($events->isEmpty()) {
+        if ($recentEvents->isEmpty()) {
             return [
                 'score' => 0.0,
                 'factors' => [
                     'event_count' => 0,
-                    'total_fatalities' => 0,
                     'days_analyzed' => $days,
+                    'data_available' => false,
+                    'message' => 'No conflict events in this period',
                 ],
             ];
         }
 
-        $eventCount = $events->count();
-        $totalFatalities = $events->sum('fatalities');
+        // Weight events by signal type
+        $signalWeights = [
+            'operational' => 1.0,    // ACLED: highest weight
+            'predictive' => 0.7,     // ICEWS: medium weight
+            'weak_signal' => 0.4,    // GDELT: lower weight
+            'contextual' => 0.3,     // Other sources
+        ];
 
-        $frequencyScore = min($eventCount / 2, 5.0);
-        $fatalityScore = min($totalFatalities / 5, 5.0);
-        $score = min($frequencyScore + $fatalityScore, 10.0);
+        $totalWeightedScore = 0;
+        $totalWeight = 0;
+        $totalFatalities = 0;
+        $eventsByType = [];
+        $eventsByProvider = [];
+
+        foreach ($recentEvents as $event) {
+            $signalType = $event->getSignalType() ?? 'contextual';
+            $weight = $signalWeights[$signalType] ?? 0.5;
+
+            // Get composite confidence (includes cross-source boost)
+            $dedup = new \App\Services\Conflict\EventDeduplicationService();
+            $confidence = $dedup->getCompositeConfidence($event);
+
+            // Time decay (more recent = higher weight)
+            $daysAgo = $date->diffInDays($event->event_date);
+            $timeDecay = max(0, 1 - ($daysAgo / $days));
+
+            // Weighted score
+            $eventScore = (
+                $event->severity_score / 10 *  // Normalize to 0-1
+                $confidence *                   // Source confidence
+                $weight *                       // Signal type weight
+                $timeDecay                      // Recency
+            );
+
+            $totalWeightedScore += $eventScore;
+            $totalWeight += ($weight * $timeDecay);
+            $totalFatalities += $event->fatalities ?? 0;
+
+            // Track event types and providers
+            $category = $event->conflictCategory->code ?? 'UNKNOWN';
+            $eventsByType[$category] = ($eventsByType[$category] ?? 0) + 1;
+            $eventsByProvider[$event->source_provider] = ($eventsByProvider[$event->source_provider] ?? 0) + 1;
+        }
+
+        // Average weighted score, scaled to 0-10
+        $conflictScore = $totalWeight > 0
+            ? ($totalWeightedScore / $totalWeight) * 10
+            : 0;
 
         return [
-            'score' => $score,
+            'score' => min(10.0, round($conflictScore, 2)),
             'factors' => [
-                'event_count' => $eventCount,
+                'event_count' => $recentEvents->count(),
                 'total_fatalities' => $totalFatalities,
                 'days_analyzed' => $days,
-                'violent_events' => $events->where('severity_score', '>', 5)->count(),
+                'data_available' => true,
+                'events_by_type' => $eventsByType,
+                'events_by_provider' => $eventsByProvider,
+                'signal_weighted' => true,
             ],
         ];
     }
@@ -360,7 +407,7 @@ class RiskScoringService
         $score += $densityScore * 0.3;
 
         return [
-            'score' => min($score, 10.0),
+            'score' => round(min($score, 10.0), 2),
             'factors' => [
                 'wash_coverage' => $washCoverage,
                 'sanitation_coverage' => $sanitationCoverage,

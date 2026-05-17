@@ -332,11 +332,86 @@ class ConflictEventNormalizer
     }
 
     /**
-     * Normalize GDELT event (future)
+     * Normalize GDELT event
      */
     protected function normalizeGdelt(array $event): array
     {
-        // TODO: Implement GDELT normalization
-        throw new \Exception("GDELT normalization not yet implemented");
+        // Map CAMEO code to canonical category
+        $cameoCode = $event['cameo_code'] ?? '19';
+        $rootCode = substr($cameoCode, 0, 2);
+
+        // Determine canonical category
+        $canonicalCategory = null;
+        switch ($rootCode) {
+            case '18': // Assault
+            case '19': // Fight
+            case '20': // Use unconventional violence
+                $canonicalCategory = 'BATTLES';
+                break;
+            case '14': // Protest
+                $canonicalCategory = 'PROTESTS';
+                break;
+            case '13': // Threaten
+                $canonicalCategory = 'STRATEGIC_DEVELOPMENTS';
+                break;
+            case '17': // Coerce
+                $canonicalCategory = 'VIOLENCE_CIVILIANS';
+                break;
+            default:
+                $canonicalCategory = 'BATTLES'; // Default
+        }
+
+        $category = ConflictCategory::where('code', $canonicalCategory)->first();
+        if (!$category) {
+            throw new \Exception("Canonical category not found: {$canonicalCategory}");
+        }
+
+        // Find district by coordinates if available
+        $district = null;
+        if (!empty($event['latitude']) && !empty($event['longitude'])) {
+            $district = $this->findDistrictByCoordinates(
+                (float) $event['latitude'],
+                (float) $event['longitude']
+            );
+        }
+
+        // GDELT uses Goldstein scale (-10 to +10, negative = conflict)
+        // Estimate fatalities from scale (rough approximation)
+        $goldsteinScale = (float) ($event['goldstein_scale'] ?? 0);
+        $estimatedFatalities = $goldsteinScale < -5 ? abs($goldsteinScale) : 0;
+
+        // Calculate severity
+        $severity = $this->calculateSeverity(
+            $canonicalCategory,
+            (int) $estimatedFatalities,
+            null
+        );
+
+        return [
+            'external_id' => $event['event_id'],
+            'conflict_category_id' => $category->id,
+            'canonical_category' => $canonicalCategory,
+            'district_id' => $district?->id,
+            'event_date' => Carbon::parse($event['event_date']),
+            'sub_event_type' => $event['event_text'] ?? null,
+            'notes' => "Media source: {$event['source_name']}",
+            'actors' => [
+                'source_name' => $event['source_name'] ?? null,
+                'source_url' => $event['source_url'] ?? null,
+            ],
+            'fatalities' => (int) $estimatedFatalities,
+            'latitude' => !empty($event['latitude']) ? (float) $event['latitude'] : null,
+            'longitude' => !empty($event['longitude']) ? (float) $event['longitude'] : null,
+            'location_name' => $event['location_name'] ?? null,
+            'severity_score' => $severity,
+            'metadata' => [
+                'cameo_code' => $cameoCode,
+                'goldstein_scale' => $goldsteinScale,
+                'tone' => $event['tone'] ?? null,
+                'themes' => $event['themes'] ?? [],
+                'language' => $event['language'] ?? 'eng',
+                'media_mentions' => $event['mentions'] ?? null,
+            ],
+        ];
     }
 }
